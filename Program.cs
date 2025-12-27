@@ -3,12 +3,16 @@ using FaceAiSharp;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 
 class Program
 {
     static void Main(string[] args)
     {
-        //Verifica argumentos
+        // Verifica argumentos
         if (args.Length < 1)
         {
             Console.WriteLine("Uso: MinhaApp <NomeDaTurmaBase>");
@@ -17,16 +21,14 @@ class Program
         string turma = args[0];
 
         // Carregar configuração do appsettings.json
-        IConfiguration config = new ConfigurationBuilder().AddJsonFile("appsettings.json", optional: false, reloadOnChange: false).Build();
+        IConfiguration config = new ConfigurationBuilder().AddJsonFile("appsettings.json", false, false)
+            .Build();
 
-        string pastaBaseTodasTurmas = config["PastaBaseAlunos"]
-            ?? throw new Exception("PastaBaseAlunos não configurada.");
-        string eventosDir = config["PastaEvento"]
-            ?? throw new Exception("PastaEvento não configurada.");
-        string outputDir = config["PastaOutput"]
-            ?? throw new Exception("PastaOutput não configurada.");
+        string pastaBaseTodasTurmas = config["PastaBaseAlunos"] ?? throw new Exception("PastaBaseAlunos não configurada.");
+        string eventosDir = config["PastaEvento"] ?? throw new Exception("PastaEvento não configurada.");
+        string outputDir = config["PastaOutput"] ?? throw new Exception("PastaOutput não configurada.");
 
-        // A pasta base concreta = pastaBaseTodasTurmas + nome da turma
+        // Define pasta base concreta da turma
         string baseAlunosDir = Path.Combine(pastaBaseTodasTurmas, turma);
 
         if (!Directory.Exists(baseAlunosDir))
@@ -35,37 +37,70 @@ class Program
             return;
         }
 
-        Console.WriteLine($"Versao EXE: 1.0.0");
+        Console.WriteLine($"Versão EXE: 1.1.0");
         Console.WriteLine($"Turma base: {turma}");
         Console.WriteLine($"Pasta base alunos: {baseAlunosDir}");
         Console.WriteLine($"Pasta evento: {eventosDir}");
         Console.WriteLine($"Pasta saída: {outputDir}");
         Console.WriteLine();
 
-        
         var detector = FaceAiSharpBundleFactory.CreateFaceDetectorWithLandmarks();
         var embedder = FaceAiSharpBundleFactory.CreateFaceEmbeddingsGenerator();
 
         var baseEmbeddings = new Dictionary<string, float[]>();
 
-        // Carrega base de alunos da turma especificada
-        foreach (var imgPath in Directory.GetFiles(baseAlunosDir))
+        // ======= CÁLCULO DE EMBEDDINGS MÉDIOS POR ALUNO =======
+        foreach (var alunoDir in Directory.GetDirectories(baseAlunosDir))
         {
-            using var img = Image.Load<Rgb24>(imgPath);
-            var faces = detector.DetectFaces(img);
-            if (!faces.Any())
+            string alunoName = Path.GetFileName(alunoDir);
+            List<float[]> embList = new List<float[]>();
+
+            foreach (var imgPath in Directory.GetFiles(alunoDir))
             {
-                Console.WriteLine($"[BASE] Nenhuma face detectada em {imgPath}, pulando.");
+                using var img = Image.Load<Rgb24>(imgPath);
+                var faces = detector.DetectFaces(img);
+
+                if (!faces.Any())
+                {
+                    Console.WriteLine($"[BASE] Nenhuma face detectada em {imgPath} — pulando.");
+                    continue;
+                }
+
+                var face = faces.First();
+                var rect = new SixLabors.ImageSharp.Rectangle(
+                    (int)Math.Round(face.Box.X),
+                    (int)Math.Round(face.Box.Y),
+                    (int)Math.Round(face.Box.Width),
+                    (int)Math.Round(face.Box.Height)
+                );
+
+                using var crop = img.Clone(ctx => ctx.Crop(rect));
+                var emb = embedder.GenerateEmbedding(crop);
+                embList.Add(emb);
+
+                Console.WriteLine($"[BASE] Embedding extraído de {imgPath}");
+            }
+
+            if (embList.Count == 0)
+            {
+                Console.WriteLine($"[BASE] Nenhuma embedding válida para {alunoName}, pulando.");
                 continue;
             }
-            var face = faces.First();
-            var rect = new SixLabors.ImageSharp.Rectangle((int)Math.Round(face.Box.X), (int)Math.Round(face.Box.Y), (int)Math.Round(face.Box.Width), (int)Math.Round(face.Box.Height));
 
-            using var crop = img.Clone(ctx => ctx.Crop(rect));
-            var embedding = embedder.GenerateEmbedding(crop);
-            string nomeAluno = Path.GetFileNameWithoutExtension(imgPath);
-            baseEmbeddings[nomeAluno] = embedding;
-            Console.WriteLine($"[BASE] Embedding gerado para {nomeAluno}");
+            int dim = embList[0].Length;
+            float[] avgEmb = new float[dim];
+
+            foreach (var e in embList)
+            {
+                for (int i = 0; i < dim; i++)
+                    avgEmb[i] += e[i];
+            }
+
+            for (int i = 0; i < dim; i++)
+                avgEmb[i] /= embList.Count;
+
+            baseEmbeddings[alunoName] = avgEmb;
+            Console.WriteLine($"[BASE] Embedding médio gerado para {alunoName} ({embList.Count} imagens)");
         }
 
         if (!baseEmbeddings.Any())
@@ -74,11 +109,12 @@ class Program
             return;
         }
 
-        // Processar fotos do evento
+        // ======= PROCESSAR FOTOS DO EVENTO =======
         foreach (var eventoPath in Directory.GetFiles(eventosDir))
         {
             using var img = Image.Load<Rgb24>(eventoPath);
             var faces = detector.DetectFaces(img);
+
             if (!faces.Any())
             {
                 Console.WriteLine($"[EVENTO] Nenhuma face detectada em {eventoPath}");
@@ -86,10 +122,17 @@ class Program
             }
 
             int faceIdx = 0;
+
             foreach (var face in faces)
             {
                 faceIdx++;
-                var rect = new SixLabors.ImageSharp.Rectangle((int)Math.Round(face.Box.X), (int)Math.Round(face.Box.Y), (int)Math.Round(face.Box.Width), (int)Math.Round(face.Box.Height));
+                var rect = new SixLabors.ImageSharp.Rectangle(
+                    (int)Math.Round(face.Box.X),
+                    (int)Math.Round(face.Box.Y),
+                    (int)Math.Round(face.Box.Width),
+                    (int)Math.Round(face.Box.Height)
+                );
+
                 try
                 {
                     using var crop = img.Clone(ctx => ctx.Crop(rect));
@@ -97,6 +140,7 @@ class Program
 
                     string bestMatch = null;
                     double bestDist = double.MaxValue;
+
                     foreach (var kv in baseEmbeddings)
                     {
                         double dist = CosineDistance(embedding, kv.Value);
@@ -107,7 +151,7 @@ class Program
                         }
                     }
 
-                    const double DIST_THRESHOLD = 0.45;
+                    const double DIST_THRESHOLD = 0.50; // você pode ajustar depois
                     Console.WriteLine($"Foto {Path.GetFileName(eventoPath)} face #{faceIdx}: melhor = {bestMatch}, distância = {bestDist:F3}");
 
                     if (bestMatch != null && bestDist < DIST_THRESHOLD)
@@ -115,16 +159,25 @@ class Program
                         string alunoDir = Path.Combine(outputDir, bestMatch);
                         Directory.CreateDirectory(alunoDir);
                         string dest = Path.Combine(alunoDir, Path.GetFileName(eventoPath));
-                        File.Move(eventoPath, dest);
-                        Console.WriteLine($" → Movido para: {dest}");
+                        if (faces.Count > 1)
+                        {
+                            File.Copy(eventoPath, dest);
+                            Console.WriteLine($" → Copiado para: {dest}");
+                        }
+
+                        else
+                        {
+                            File.Move(eventoPath, dest);
+                            Console.WriteLine($" → Movido para: {dest}");
+                        }
+                            
                         break;
                     }
                 }
                 catch (Exception)
                 {
-                    Console.WriteLine($"Foto {Path.GetFileName(eventoPath)}  um erro aconteceu — mantendo em evento ou mover manualmente.");
+                    Console.WriteLine($"Foto {Path.GetFileName(eventoPath)} — erro ao processar face #{faceIdx}");
                     continue;
-             
                 }
             }
         }
